@@ -27,6 +27,19 @@ CONFIG = {
     "market_url_template": "https://www.paribu.com/markets/{pair}",
 }
 
+# Hızlı yol dosyaları
+AUTH_HEADERS_FILE = "auth_headers.json"
+ADDR_CACHE_FILE = "addresses_cache.json"
+
+def _load_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_json(path, data):
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
 def _open_persistent(pw, headless=True):
     context = pw.chromium.launch_persistent_context(
         USER_DATA_DIR,
@@ -419,51 +432,98 @@ def _sniff_auth_token(pw, show=False, trigger_url=None, wait_ms=7000):
     context.close()
     return token["val"]
 
-def cmd_get_deposit_direct(asset: str, network: str, auth: str):
+def _sniff_and_save_auth_headers(show=False, wait_ms=6000):
     with sync_playwright() as pw:
-        context, page = _open_persistent(pw, headless=True)
-
-        token = auth or os.getenv("PARIBU_AUTH")
-        pragma_cache_local = None
-
-        if not token:
-            captured = {"auth": None, "pcl": None}
-            def on_request(req):
-                if req.url.startswith("https://web.paribu.com/user"):
-                    a = req.headers.get("authorization")
-                    p = req.headers.get("pragma-cache-local")
-                    if a and not captured["auth"]:
-                        captured["auth"] = a
-                        captured["pcl"] = p
-            context.on("request", on_request)
-
-            page.goto(CONFIG["wallet_url"], wait_until="domcontentloaded")
-            page.reload()
-            page.wait_for_timeout(6000)
-
-            token = captured["auth"]
-            pragma_cache_local = captured["pcl"]
-
-        if not token:
-            context.close()
-            raise SystemExit("Authorization bulunamadı. Girişli olduğunuzdan emin olun veya --auth ile verin.")
-
-        headers = {
-            "authorization": token,
-            "origin": "https://www.paribu.com",
-            "referer": "https://www.paribu.com/",
-        }
-        if pragma_cache_local:
-            headers["pragma-cache-local"] = pragma_cache_local
-
-        r = context.request.get("https://web.paribu.com/user", headers=headers)
-        if r.status >= 400:
-            context.close()
-            raise SystemExit(f"HTTP {r.status}: {r.text()[:300]}")
-        data = r.json()
-        addr = _pick_address_from_user_payload(data, asset, network)
-        print(addr)
+        context, page = _open_persistent(pw, headless=not show)
+        captured = {"authorization": None, "pragma-cache-local": None}
+        def on_request(req):
+            if "https://web.paribu.com/" in req.url:
+                a = req.headers.get("authorization")
+                p = req.headers.get("pragma-cache-local")
+                if a and not captured["authorization"]:
+                    captured["authorization"] = a
+                    captured["pragma-cache-local"] = p
+        context.on("request", on_request)
+        page.goto(CONFIG["wallet_url"], wait_until="domcontentloaded")
+        page.reload()
+        page.wait_for_timeout(wait_ms)
         context.close()
+    if not captured["authorization"]:
+        raise SystemExit("Authorization yakalanamadı. Önce giriş yapın, sonra tekrar deneyin.")
+    _save_json(AUTH_HEADERS_FILE, captured)
+    return captured
+
+def _get_auth_headers(pw=None, show=False, force_sniff=False):
+    if not force_sniff and Path(AUTH_HEADERS_FILE).exists():
+        data = _load_json(AUTH_HEADERS_FILE)
+        if data.get("authorization"):
+            return data
+    # gerekirse yakala
+    return _sniff_and_save_auth_headers(show=show)
+
+def cmd_get_deposit_direct(asset: str, network: str, auth: str = None, refresh: bool = False, show: bool = False):
+    # 1) Adres cache
+    key = f"{asset.upper()}|{network.upper()}"
+    cache = _load_json(ADDR_CACHE_FILE)
+    if not refresh and key in cache:
+        print(cache[key])
+        return
+
+    # 2) Yetkili başlıkları hazırla
+    headers = None
+    if auth:
+        headers = {"authorization": auth}
+    else:
+        headers = _get_auth_headers(show=show)
+
+    # 3) Sadece HTTP (tarayıcı açmadan). storage_state ile aynı çerezler de yüklensin.
+    with sync_playwright() as pw:
+        rc = pw.request.new_context(
+            base_url="https://web.paribu.com",
+            storage_state=AUTH_STATE_FILE if Path(AUTH_STATE_FILE).exists() else None,
+            extra_http_headers={
+                "authorization": headers.get("authorization"),
+                "origin": "https://www.paribu.com",
+                "referer": "https://www.paribu.com/",
+                **({"pragma-cache-local": headers.get("pragma-cache-local")} if headers.get("pragma-cache-local") else {}),
+            },
+            timeout=8000,
+        )
+        r = rc.get("/user")
+        if r.status >= 400:
+            # Son çare: tek sefer kalıcı profilden çağır (çok nadir)
+            with sync_playwright() as pw2:
+                context, _ = _open_persistent(pw2, headless=True)
+                rr = context.request.get("https://web.paribu.com/user", headers={
+                    "authorization": headers.get("authorization"),
+                    "origin": "https://www.paribu.com",
+                    "referer": "https://www.paribu.com/",
+                    **({"pragma-cache-local": headers.get("pragma-cache-local")} if headers.get("pragma-cache-local") else {}),
+                })
+                if rr.status >= 400:
+                    context.close()
+                    raise SystemExit(f"HTTP {rr.status}: {rr.text()[:300]}")
+                data = rr.json()
+                context.close()
+        else:
+            data = r.json()
+
+    addr = _pick_address_from_user_payload(data, asset, network)
+    cache[key] = addr
+    _save_json(ADDR_CACHE_FILE, cache)
+    print(addr)
+
+def cmd_grab_auth(show=False):
+    _sniff_and_save_auth_headers(show=show)
+    print(f"Kaydedildi: {AUTH_HEADERS_FILE}")
+
+def cmd_clear_cache():
+    for f in [AUTH_HEADERS_FILE, ADDR_CACHE_FILE]:
+        try:
+            Path(f).unlink()
+            print(f"Silindi: {f}")
+        except Exception:
+            pass
 
 def main():
     ap = argparse.ArgumentParser()
@@ -493,11 +553,21 @@ def main():
     p0 = sub.add_parser("auth-info", help="auth_state.json içeriğini özetle")
     p0.set_defaults(func=lambda args: cmd_auth_info())
 
+    pG = sub.add_parser("grab-auth", help="Authorization/başlıkları yakala ve kaydet")
+    pG.add_argument("--show", action="store_true")
+    pG.set_defaults(func=lambda args: cmd_grab_auth(show=args.show))
+
+    pCC = sub.add_parser("clear-cache", help="auth/addr cache dosyalarını sil")
+    pCC.set_defaults(func=lambda args: cmd_clear_cache())
+
+    # get-deposit-direct’e bayraklar
     pD2 = sub.add_parser("get-deposit-direct", help="Adres (asset/network) için /user JSON'undan direkt çek")
     pD2.add_argument("--asset", required=True)
     pD2.add_argument("--network", required=True)
-    pD2.add_argument("--auth", help="Authorization header değeri; yoksa otomatik yakalanır")
-    pD2.set_defaults(func=lambda args: cmd_get_deposit_direct(args.asset.upper(), args.network.upper(), args.auth))
+    pD2.add_argument("--auth", help="Authorization; yoksa kaydedilmiş başlıklar kullanılır")
+    pD2.add_argument("--refresh", action="store_true", help="Adres cache’ini yenile")
+    pD2.add_argument("--show", action="store_true", help="Gerekirse yakalama için görünür mod")
+    pD2.set_defaults(func=lambda args: cmd_get_deposit_direct(args.asset.upper(), args.network.upper(), args.auth, args.refresh, args.show))
 
     args = ap.parse_args()
     args.func(args)
